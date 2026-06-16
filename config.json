@@ -1,0 +1,334 @@
+{
+  "$comment": "Orchestration config v2. Opus=designer+reviewer(read-only)+arbiter(consilium-write). mimo=primary executor. gemini=alternate executor / 2nd reviewer. bins+nodeBin are self-healed by preflight.ps1.",
+  "nodeBin": "",
+  "bins": {
+    "claude": "",
+    "mimo": "",
+    "gemini": "",
+    "git": ""
+  },
+  "roles": {
+    "orchestrator": {
+      "cli": "claude",
+      "model": "opus",
+      "canWrite": false
+    },
+    "reviewer": {
+      "cli": "claude",
+      "model": "opus"
+    },
+    "executor": {
+      "cli": "mimo",
+      "model": "mimo/mimo-auto",
+      "agent": "build"
+    }
+  },
+  "geminiExecutor": {
+    "cli": "gemini",
+    "model": "gemini-3.5-flash"
+  },
+  "maxIterations": 4,
+  "verifyCommand": "",
+  "diffMaxChars": 60000,
+  "verifyMaxChars": 12000,
+  "referenceDir": "",
+  "phases": {
+    "testDesigner": false,
+    "secondReviewer": false,
+    "render": false,
+    "audits": false,
+    "uxCopy": false
+  },
+  "context": {
+    "maxSliceChars": 12000,
+    "lockStaleMs": 1800000
+  },
+  "limits": {
+    "execTimeoutMs": 900000,
+    "opusTimeoutMs": 600000,
+    "gitTimeoutMs": 60000,
+    "maxBufBytes": 67108864
+  },
+  "designSystem": {
+    "maxFiles": 40,
+    "componentGlobCap": 12,
+    "fillGreenfieldGaps": true,
+    "greenfieldDarkForAndroid": true,
+    "mimoUseFileFlag": true,
+    "envOverrides": {
+      "globs": "ORCHESTRA_DESIGN_GLOBS",
+      "stack": "ORCHESTRA_STACK",
+      "verify": "ORCHESTRA_VERIFY_CMD"
+    },
+    "universalCarriers": [
+      "**/design-tokens.json",
+      "**/tokens.json",
+      "**/*.tokens.json",
+      "**/style-dictionary*.{json,js,cjs,mjs}"
+    ],
+    "ignoreDirs": [
+      "node_modules",
+      ".git",
+      "build",
+      ".gradle",
+      "dist",
+      "out",
+      ".next",
+      ".idea",
+      ".dart_tool",
+      "Pods",
+      "DerivedData",
+      "target",
+      "vendor",
+      ".venv",
+      "__pycache__",
+      "runs"
+    ],
+    "stacks": {
+      "android-compose": {
+        "globs": [
+          "**/ui/theme/Color*.kt",
+          "**/ui/theme/Colors.kt",
+          "**/theme/Color*.kt",
+          "**/ui/theme/Type*.kt",
+          "**/ui/theme/Typography.kt",
+          "**/ui/theme/Spacing*.kt",
+          "**/ui/theme/Dimens*.kt",
+          "**/ui/theme/Shape*.kt",
+          "**/ui/theme/Shapes.kt",
+          "**/ui/theme/Elevation*.kt",
+          "**/ui/theme/Motion*.kt",
+          "**/ui/theme/Theme.kt",
+          "**/res/values/colors.xml",
+          "**/res/values/dimens.xml",
+          "**/res/values/themes.xml",
+          "**/res/values/styles.xml"
+        ],
+        "verifyCmd": ""
+      },
+      "ios-swiftui": {
+        "globs": [
+          "**/*.xcassets/**/Contents.json",
+          "**/Theme.swift",
+          "**/Color*.swift",
+          "**/Colors.swift",
+          "**/DesignSystem*.swift",
+          "**/Typography.swift",
+          "**/Font*.swift",
+          "**/Spacing*.swift",
+          "**/Tokens.swift",
+          "**/design-tokens.json"
+        ],
+        "verifyCmd": ""
+      },
+      "flutter": {
+        "globs": [
+          "**/theme.dart",
+          "**/theme/*.dart",
+          "**/app_theme.dart",
+          "**/colors.dart",
+          "**/app_colors.dart",
+          "**/typography.dart",
+          "**/text_styles.dart",
+          "**/spacing.dart",
+          "**/dimens.dart",
+          "**/tokens.dart",
+          "**/design-tokens.json"
+        ],
+        "verifyCmd": "flutter analyze"
+      },
+      "web-react": {
+        "globs": [
+          "tailwind.config.{js,cjs,mjs,ts}",
+          "**/theme.{ts,js,tsx,jsx}",
+          "**/theme/index.{ts,js}",
+          "**/tokens.{ts,js,json}",
+          "**/design-tokens.json",
+          "**/styles/{globals,tokens,variables,theme}.{css,scss}",
+          "**/*.module.css"
+        ],
+        "verifyCmd": ""
+      },
+      "web-vue": {
+        "globs": [
+          "tailwind.config.{js,cjs,mjs,ts}",
+          "**/assets/**/{tokens,variables,theme,main}.{css,scss}",
+          "**/styles/*.{css,scss}",
+          "**/theme.{ts,js}",
+          "**/tokens.{ts,js,json}",
+          "**/design-tokens.json"
+        ],
+        "verifyCmd": ""
+      },
+      "web-svelte": {
+        "globs": [
+          "tailwind.config.{js,cjs,mjs,ts}",
+          "**/app.css",
+          "**/styles/*.{css,scss}",
+          "**/theme.{ts,js}",
+          "**/tokens.{ts,js,json}",
+          "**/design-tokens.json"
+        ],
+        "verifyCmd": ""
+      },
+      "web-angular": {
+        "globs": [
+          "**/styles.{css,scss}",
+          "**/styles/**/*.{css,scss}",
+          "**/_variables.scss",
+          "**/theme.scss",
+          "**/tokens.{ts,scss,json}",
+          "**/design-tokens.json",
+          "tailwind.config.*"
+        ],
+        "verifyCmd": ""
+      },
+      "web-vanilla": {
+        "globs": [
+          "**/{styles,style,main,index,tokens,variables,theme}.css",
+          "**/css/*.css",
+          "**/design-tokens.json",
+          "**/index.html"
+        ],
+        "verifyCmd": ""
+      },
+      "react-native": {
+        "globs": [
+          "**/theme.{ts,js,tsx,jsx}",
+          "**/theme/index.{ts,js}",
+          "**/styles/theme.{ts,js}",
+          "**/tokens.{ts,js,json}",
+          "**/design-tokens.json",
+          "**/colors.{ts,js}"
+        ],
+        "verifyCmd": ""
+      },
+      "node-backend": {
+        "globs": [
+          "**/design-tokens.json",
+          "**/tokens.{json,js,ts}",
+          "**/theme.{js,ts}"
+        ],
+        "verifyCmd": ""
+      },
+      "python": {
+        "globs": [
+          "**/design-tokens.json",
+          "**/static/**/*.css",
+          "**/_variables.scss",
+          "**/tokens.json"
+        ],
+        "verifyCmd": ""
+      },
+      "rust": {
+        "globs": [
+          "**/design-tokens.json",
+          "**/tokens.{json,toml}"
+        ],
+        "verifyCmd": "cargo check"
+      },
+      "go": {
+        "globs": [
+          "**/design-tokens.json",
+          "**/static/**/*.css"
+        ],
+        "verifyCmd": "go build ./..."
+      },
+      "generic": {
+        "globs": [
+          "**/design-tokens.json",
+          "**/tokens.{json,js,ts}",
+          "**/_variables.scss",
+          "**/{theme,variables,tokens}.{css,scss}"
+        ],
+        "verifyCmd": ""
+      }
+    }
+  },
+  "render": {
+    "enabled": false,
+    "maxShots": 12,
+    "maxShotsToOpus": 6,
+    "shotBudgetBytes": 6291456,
+    "timeoutMs": 600000,
+    "reshootEachIter": false,
+    "states": [
+      "loading",
+      "empty",
+      "error",
+      "success"
+    ],
+    "themes": [],
+    "fontScales": [
+      1,
+      1.3
+    ],
+    "widths": [
+      360,
+      411
+    ],
+    "android": {
+      "engine": "auto",
+      "sdkRoot": "",
+      "previewGlobs": [
+        "**/*Preview*.kt",
+        "**/*ScreenV2.kt"
+      ],
+      "roborazziTask": "recordRoborazziDebug",
+      "paparazziTask": "recordPaparazziDebug",
+      "outputGlobs": [
+        "**/build/outputs/roborazzi/**/*.png",
+        "**/build/paparazzi/**/*.png",
+        "**/snapshots/**/*.png"
+      ]
+    },
+    "web": {
+      "engine": "auto",
+      "playwrightScript": "npm run screenshot",
+      "storybookStaticDir": "storybook-static",
+      "outputGlobs": [
+        "**/__screenshots__/**/*.png",
+        "playwright-report/**/*.png",
+        "test-results/**/*.png"
+      ]
+    },
+    "reference": {
+      "maxRefs": 4,
+      "copyIntoRun": true,
+      "acceptThreshold": 85
+    }
+  },
+  "pricing": {
+    "currency": "USD",
+    "perMTokens": true,
+    "cacheReadMultiplier": 0.1,
+    "cacheWrite5mMultiplier": 1.25,
+    "cacheWrite1hMultiplier": 2,
+    "models": {
+      "claude-opus-4-8": {
+        "in": 5,
+        "out": 25
+      },
+      "claude-haiku-4-5": {
+        "in": 1,
+        "out": 5
+      },
+      "claude-sonnet-4-6": {
+        "in": 3,
+        "out": 15
+      },
+      "mimo/mimo-auto": {
+        "in": 0,
+        "out": 0,
+        "free": true
+      },
+      "gemini-3.5-flash": {
+        "in": 0,
+        "out": 0,
+        "metered": false
+      }
+    },
+    "baselineModel": "claude-opus-4-8",
+    "unknownModelFallback": "claude-opus-4-8"
+  }
+}

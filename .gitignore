@@ -1,0 +1,5 @@
+# secrets and run artifacts — never commit
+.env.local
+runs/
+context/
+_design/
