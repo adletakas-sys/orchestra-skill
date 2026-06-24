@@ -1,0 +1,15 @@
+{
+  "name": "orchestra-skill",
+  "version": "2.1.0",
+  "description": "Multi-agent build orchestrator — Opus designs + reviews, MiMoCode builds, Gemini optional.",
+  "type": "module",
+  "main": "orchestrate.mjs",
+  "scripts": {
+    "start": "node orchestrate.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["claude", "opus", "mimo", "gemini", "orchestrator", "multi-agent", "code-generation"],
+  "license": "MIT"
+}
