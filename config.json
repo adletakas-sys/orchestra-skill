@@ -1,11 +1,11 @@
 {
   "$comment": "Orchestration config v2. Opus=designer+reviewer(read-only)+arbiter(consilium-write). mimo=primary executor. gemini=alternate executor / 2nd reviewer. bins+nodeBin are self-healed by preflight.ps1.",
-  "nodeBin": "",
+  "nodeBin": "C:\\Program Files\\nodejs",
   "bins": {
-    "claude": "",
+    "claude": "C:\\Users\\Administrator\\AppData\\Roaming\\npm\\claude.cmd",
     "mimo": "",
     "gemini": "",
-    "git": ""
+    "git": "C:\\Program Files\\Git\\cmd\\git.exe"
   },
   "roles": {
     "orchestrator": {
@@ -13,9 +13,17 @@
       "model": "opus",
       "canWrite": false
     },
+    "planner": {
+      "cli": "claude",
+      "model": "opus",
+      "$comment": "Override with --planner-model sonnet to use Sonnet for the PLAN phase (cheaper, ~same quality for decomposition)"
+    },
     "reviewer": {
       "cli": "claude",
-      "model": "opus"
+      "model": "opus",
+      "escalateModel": "sonnet",
+      "escalateThreshold": 70,
+      "$comment": "escalateModel+escalateThreshold: Sonnet does first pass; escalates to Opus if score < threshold or has blocking issues. Activated with --escalate-reviewer"
     },
     "executor": {
       "cli": "mimo",
@@ -29,6 +37,20 @@
   },
   "maxIterations": 4,
   "verifyCommand": "",
+  "execution": {
+    "parallelCandidates": false,
+    "$commentParallel": "parallelCandidates: run mimo+gemini sequentially on iter 1, Opus read-only arbiter picks best. Activated with --parallel-exec",
+    "mimoLockTimeoutMs": 300000,
+    "$commentLock": "mimoLockTimeoutMs: max ms to wait for mimo.lock before proceeding anyway (5 min default)",
+    "earlyExitScore": 95,
+    "$commentEarlyExit": "earlyExitScore: auto-approve without further iterations when review score >= this (and no blocking issues)",
+    "abortScore": 20,
+    "$commentAbortScore": "abortScore: abort early when score < this AND no diff produced (executor not making progress)"
+  },
+  "budget": {
+    "maxUsd": 0,
+    "$comment": "maxUsd: spend ceiling in USD. 0 = unlimited. Pass --budget N to override per-run. Disables optional phases when 90% consumed."
+  },
   "diffMaxChars": 60000,
   "verifyMaxChars": 12000,
   "referenceDir": "",

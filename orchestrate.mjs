@@ -1,20 +1,31 @@
 #!/usr/bin/env node
 /**
- * orchestrate.mjs — universal /orchestra pipeline (v2).
+ * orchestrate.mjs — universal /orchestra pipeline (v2.1).
  *
  *   Opus (claude)  : DESIGNER (PLAN) + REVIEWER (REVIEW), read-only by default.
  *                    In CONSILIUM only (and only for heavy steps), ARBITER that may WRITE.
  *   MiMoCode       : primary EXECUTOR (writes code).
  *   Gemini         : alternate executor (--executor gemini) + 2nd reviewer (--dual-review).
  *
- * Flow: DESIGN-SCAN -> [C3 test] -> PLAN -> { EXECUTE|CONSILIUM -> diff -> GATE -> RENDER -> VERIFY
- *        -> REVIEW -> C2 -> D2 -> C4 audits -> B4 ux-copy -> ctx }* until approved or max-iters.
+ * Flow: DESIGN-SCAN -> [C3 test] -> PLAN -> { EXECUTE|LITE-CONSILIUM|CONSILIUM -> diff -> GATE
+ *        -> RENDER -> VERIFY -> REVIEW(escalating) -> C2 -> D2 -> C4 audits -> B4 ux-copy -> ctx }*
+ *        until approved or max-iters.
  *
- * The orchestrator only edits files in --dir (default: cwd). Opus is read-only except consilium.
- * See _design/00_SYNTHESIS.md for the locked design.
+ * v2.1 additions:
+ *   --planner-model <model>  : use a cheaper model (e.g. sonnet) for the PLAN phase
+ *   --escalate-reviewer      : Sonnet does first review pass; escalates to Opus if score < threshold
+ *   --lite-consilium         : dual mimo+gemini candidates, read-only Opus arbiter (no canWrite needed)
+ *   --parallel-exec          : dual candidates on EVERY iteration (not just heavy steps)
+ *   --budget <usd>           : abort / disable optional phases when spend exceeds ceiling
+ *   --resume <run-dir>       : resume from an existing run (loads spec.json + last verdict)
+ *   mimo.lock                : file-based sequential lock prevents CPU contention when multiple
+ *                              Orchestra instances run concurrently (--lock-mimo to enable)
+ *   spec pre-validation      : warns when relevant_files don't exist in the target repo
+ *   adaptive early-exit      : auto-approve at earlyExitScore, abort at abortScore with no diff
+ *   cost summary             : prints spend + savings at the end of every run
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
@@ -55,6 +66,7 @@ function parseArgs(argv) {
     else if (t === "--verify") a.verify = argv[++i];
     else if (t === "--executor") a.executor = argv[++i];      // mimo | gemini
     else if (t === "--model") a.execModel = argv[++i];
+    else if (t === "--planner-model") a.plannerModel = argv[++i];  // e.g. sonnet
     else if (t === "--no-review") a.noReview = true;
     else if (t === "--tdd") a.tdd = true;
     else if (t === "--dual-review") a.dualReview = true;
@@ -62,7 +74,13 @@ function parseArgs(argv) {
     else if (t === "--audit") a.audit = true;
     else if (t === "--ux-copy") a.uxCopy = true;
     else if (t === "--consilium") a.consilium = true;
+    else if (t === "--lite-consilium") a.liteConsilium = true;   // dual candidates, read-only arbiter
+    else if (t === "--parallel-exec") a.parallelExec = true;     // dual candidates on every iter
+    else if (t === "--escalate-reviewer") a.escalateReviewer = true;
     else if (t === "--ref-dir") a.refDir = argv[++i];
+    else if (t === "--budget") a.budget = parseFloat(argv[++i]); // USD ceiling
+    else if (t === "--resume") a.resume = argv[++i];             // path to prior run dir
+    else if (t === "--lock-mimo") a.lockMimo = true;             // sequential mimo lock
     else a._.push(t);
   }
   return a;
@@ -76,6 +94,30 @@ const EXECUTOR = args.executor || cfg.roles.executor.cli;     // mimo | gemini
 const execModel = args.execModel;
 const DRY = !!args.dryRun;
 const REF_DIR = args.refDir || cfg.referenceDir || "";
+
+// Planner model: --planner-model overrides config.roles.planner.model, falls back to orchestrator model
+const PLANNER_MODEL = args.plannerModel || cfg.roles.planner?.model || cfg.roles.orchestrator.model;
+
+// Escalating reviewer config
+const ESCALATE_REVIEWER = args.escalateReviewer || false;
+const ESCALATE_MODEL = cfg.roles.reviewer?.escalateModel || "sonnet";
+const ESCALATE_THRESHOLD = cfg.roles.reviewer?.escalateThreshold ?? 70;
+
+// Lite-consilium / parallel-exec (dual candidates without canWrite)
+const LITE_CONSILIUM = args.liteConsilium || false;
+const PARALLEL_EXEC = args.parallelExec || false;
+
+// Budget ceiling
+const BUDGET_USD = args.budget ?? cfg.budget?.maxUsd ?? 0;  // 0 = unlimited
+
+// Adaptive exit thresholds
+const EARLY_EXIT_SCORE = cfg.execution?.earlyExitScore ?? 95;
+const ABORT_SCORE = cfg.execution?.abortScore ?? 20;
+
+// Mimo lock
+const USE_MIMO_LOCK = args.lockMimo || false;
+const MIMO_LOCK_FILE = join(__dirname, "mimo.lock");
+const MIMO_LOCK_TIMEOUT_MS = cfg.execution?.mimoLockTimeoutMs ?? 300000;
 
 if (!TASK) {
   console.error('ERROR: no task. Pass a task string, --task "...", or --task-file <path>.');
@@ -105,13 +147,11 @@ function commonDir(files) {
     if (split.every((s) => s[i] === seg)) common.push(seg); else break;
   }
   let d = common.join("/");
-  // A single heavy file yields a FILE path — demote to its directory so --add-dir scopes correctly.
   if (d && existsSync(d)) { try { if (statSync(d).isFile()) d = dirname(d); } catch {} }
   return d && existsSync(d) ? d : TARGET;
 }
 
-// Capture a candidate's full change set INCLUDING new/untracked files (git diff HEAD alone drops
-// untracked files, then clean -fd would destroy them), then restore the tree to baseline.
+// Capture a candidate's full change set then restore tree to baseline.
 async function captureCandidate() {
   await git(["add", "-A"]);
   const patch = (await git(["diff", "--cached", "HEAD"])).stdout;
@@ -127,9 +167,7 @@ async function applyCandidate(patchPath, it) {
   }
   return ap.code === 0;
 }
-// `git diff HEAD` omits untracked NEW files — and creating files is the common case, so the
-// reviewer would otherwise get an empty diff. Intent-to-add surfaces new files in the diff;
-// `reset -q` then clears the intent (worktree untouched, files stay untracked).
+// `git diff HEAD` omits untracked NEW files — intent-to-add surfaces them.
 async function captureDiff() {
   await git(["add", "-N", "."]);
   const diff = (await git(["diff", "HEAD"])).stdout;
@@ -145,6 +183,128 @@ async function runExecutor(who, message, isContinue) {
     { cwd: TARGET, runDir: RUN_DIR, mimoBin: cfg.bins.mimo, agent: cfg.roles.executor.agent, useFileFlag: cfg.designSystem.mimoUseFileFlag });
 }
 
+// ---------- mimo lock ----------
+async function withMimoLock(fn) {
+  if (!USE_MIMO_LOCK) return fn();
+  const staleMs = (cfg.limits?.execTimeoutMs ?? 900000) + 60000; // exec timeout + 1 min buffer
+  const start = Date.now();
+  while (true) {
+    try {
+      const fd = openSync(MIMO_LOCK_FILE, "wx");
+      try { writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}`); } catch {}
+      closeSync(fd);
+      try { return await fn(); }
+      finally { try { unlinkSync(MIMO_LOCK_FILE); } catch {} }
+    } catch (e) {
+      if (e.code !== "EEXIST") { log("WARN mimo-lock: " + e.message + "; running unlocked"); return fn(); }
+      // Steal stale lock
+      try {
+        const st = statSync(MIMO_LOCK_FILE);
+        if (Date.now() - st.mtimeMs > staleMs) {
+          log("mimo-lock: stealing stale lock (prior run likely died)");
+          try { unlinkSync(MIMO_LOCK_FILE); } catch {}
+          continue;
+        }
+      } catch {}
+      if (Date.now() - start > MIMO_LOCK_TIMEOUT_MS) {
+        log(`mimo-lock: timeout waiting (${MIMO_LOCK_TIMEOUT_MS / 1000}s); running unlocked`);
+        return fn();
+      }
+      log("mimo-lock: locked by another instance — waiting 5s...");
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+}
+
+// ---------- budget checker ----------
+function checkBudget(usage) {
+  if (!BUDGET_USD || BUDGET_USD <= 0) return { ok: true, spent: 0, remaining: Infinity };
+  const spent = usage.snapshotTotals().est_cost_usd;
+  const remaining = BUDGET_USD - spent;
+  if (remaining <= 0) {
+    log(`BUDGET EXCEEDED: spent $${spent.toFixed(4)} / $${BUDGET_USD}`);
+    return { ok: false, spent, remaining: 0 };
+  }
+  if (remaining < BUDGET_USD * 0.1) {
+    log(`BUDGET WARNING: $${remaining.toFixed(4)} remaining of $${BUDGET_USD}`);
+  }
+  return { ok: true, spent, remaining };
+}
+
+// ---------- spec pre-validation ----------
+function validateSpec(spec) {
+  const s = spec || {};
+  const missing = (s.relevant_files || []).filter((f) => f && !existsSync(resolve(TARGET, f)));
+  if (missing.length) log(`WARN spec-validate: ${missing.length} relevant_file(s) not found in target: ${missing.join(", ")}`);
+  if (!(s.acceptance_criteria || []).length) log("WARN spec-validate: spec has no acceptance_criteria");
+}
+
+// ---------- escalating reviewer ----------
+// Calls Sonnet first; if score < ESCALATE_THRESHOLD or has blocking issues, escalates to Opus.
+// Always uses the primary (Opus) model when escalation is off or escalation model matches primary.
+async function callReviewer(prompt, label, opts) {
+  const primaryModel = cfg.roles.reviewer.model;
+  if (!ESCALATE_REVIEWER || !ESCALATE_MODEL || ESCALATE_MODEL === primaryModel) {
+    return callOpus(primaryModel, prompt, label, opts);
+  }
+  log(`  reviewer: fast pass with ${ESCALATE_MODEL}...`);
+  const fast = await callOpus(ESCALATE_MODEL, prompt, `${label}-fast`, opts);
+  usage.record({ phase: `review-fast`, agent: "opus", model: ESCALATE_MODEL, envelope: fast.envelope });
+  const fastVerdict = extractJson(fast.text) || {};
+  const score = typeof fastVerdict.score === "number" ? fastVerdict.score : 0;
+  const hasBlocking = (fastVerdict.blocking_issues || []).length > 0 || fastVerdict.approved === false;
+  if (score >= ESCALATE_THRESHOLD && !hasBlocking) {
+    log(`  reviewer: ${ESCALATE_MODEL} score=${score} >= ${ESCALATE_THRESHOLD}, no blocking → accepted`);
+    return fast;
+  }
+  log(`  reviewer: ${ESCALATE_MODEL} score=${score} < ${ESCALATE_THRESHOLD} or blocking → escalating to ${primaryModel}`);
+  return callOpus(primaryModel, prompt, label, opts);
+}
+
+// ---------- dual-candidate execution (lite-consilium / parallel-exec) ----------
+// Runs mimo then gemini sequentially (shared working tree prevents true parallel),
+// captures each patch, then read-only Opus arbiter picks the winner and applies it.
+// Falls back to single executor if gemini bin is missing.
+async function runDualCandidates(it, execMessage, tokens) {
+  if ((await git(["status", "--short"])).stdout.trim()) {
+    log("WARN dual-candidates: working tree dirty — falling back to single executor");
+    return runExecutor(EXECUTOR, execMessage, it > 1);
+  }
+  const cands = {};
+  const runners = ["mimo"];
+  if (cfg.bins.gemini) runners.push("gemini"); else log("  dual-candidates: gemini bin not configured — mimo only");
+
+  for (const who of runners) {
+    log(`  dual-candidates: running ${who}...`);
+    await runExecutor(who, execMessage, false);
+    usage.record({ phase: `dual-${who}-${it}`, agent: who, model: execModel || "" });
+    cands[who] = await captureCandidate();
+    artifact(`cand.${who}.${it}.patch`, cands[who]);
+  }
+
+  if (Object.keys(cands).length < 2) {
+    // Only one candidate — skip arbitration, apply directly
+    const only = Object.keys(cands)[0];
+    if (cands[only]) {
+      await applyCandidate(join(RUN_DIR, `cand.${only}.${it}.patch`), it);
+    }
+    return { code: 0, timedOut: false };
+  }
+
+  // Read-only Opus arbiter picks the best candidate
+  log(`  dual-candidates: Opus arbiter choosing best of [${Object.keys(cands).join(", ")}]...`);
+  const arbRes = await callOpus(cfg.roles.reviewer.model,
+    P.consiliumArbiterPrompt({}, [], cands, tokens),
+    `dual-arbiter-${it}`, { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude });
+  usage.record({ phase: `dual-arbiter-${it}`, agent: "opus", model: cfg.roles.reviewer.model, envelope: arbRes.envelope });
+  const cv = extractJson(arbRes.text) || { chosen_candidate: Object.keys(cands)[0] };
+  artifact(`dual-arbiter.${it}.json`, JSON.stringify(cv, null, 2));
+  const winner = (cands[cv.chosen_candidate] != null) ? cv.chosen_candidate : Object.keys(cands)[0];
+  log(`  dual-candidates: winner = ${winner} (${cv.rationale ? cv.rationale.slice(0, 80) : ""})`);
+  await applyCandidate(join(RUN_DIR, `cand.${winner}.${it}.patch`), it);
+  return { code: 0, timedOut: false };
+}
+
 // module-scope so the top-level catch can flush them
 let ctx = null, usage = null;
 
@@ -152,13 +312,16 @@ async function main() {
   log(`# Orchestration run ${stamp}`);
   log(`target   : ${TARGET}`);
   log(`executor : ${EXECUTOR} (model ${execModel || (EXECUTOR === "gemini" ? cfg.geminiExecutor.model : cfg.roles.executor.model)})`);
-  log(`reviewer : ${cfg.roles.reviewer.cli} (${cfg.roles.reviewer.model})  max-iters=${MAX_ITERS}`);
-  log(`phases   : tdd=${!!(args.tdd || cfg.phases.testDesigner)} dual=${!!(args.dualReview || cfg.phases.secondReviewer)} render=${!!(args.render || cfg.phases.render)} audit=${!!(args.audit || cfg.phases.audits)} ux-copy=${!!(args.uxCopy || cfg.phases.uxCopy)} consilium=${!!args.consilium}`);
+  log(`planner  : ${cfg.roles.orchestrator.cli} (${PLANNER_MODEL})`);
+  log(`reviewer : ${cfg.roles.reviewer.cli} (${cfg.roles.reviewer.model})${ESCALATE_REVIEWER ? " escalate=" + ESCALATE_MODEL + "@" + ESCALATE_THRESHOLD : ""}  max-iters=${MAX_ITERS}`);
+  log(`phases   : tdd=${!!(args.tdd || cfg.phases.testDesigner)} dual=${!!(args.dualReview || cfg.phases.secondReviewer)} render=${!!(args.render || cfg.phases.render)} audit=${!!(args.audit || cfg.phases.audits)} ux-copy=${!!(args.uxCopy || cfg.phases.uxCopy)} consilium=${!!args.consilium} lite-consilium=${LITE_CONSILIUM} parallel-exec=${PARALLEL_EXEC}`);
+  if (BUDGET_USD > 0) log(`budget   : $${BUDGET_USD}`);
+  if (args.resume) log(`resume   : ${args.resume}`);
   log(`task     : ${TASK.replace(/\s+/g, " ").slice(0, 200)}`);
   log("");
 
   if (DRY) {
-    log("[DRY RUN] No CLIs invoked. Planner prompt that WOULD be sent to Opus:\n");
+    log("[DRY RUN] No CLIs invoked. Planner prompt that WOULD be sent:\n");
     const prompt = P.plannerPrompt(TASK, {}, "", !!args.consilium);
     log(prompt);
     artifact("planner.prompt.txt", prompt);
@@ -177,21 +340,65 @@ async function main() {
   ctx = await loadContext({ projectDir: TARGET, skillRoot: __dirname, runDir: RUN_DIR, cfg });
   usage = createUsage({ runDir: RUN_DIR, runStamp: stamp, cfg });
 
-  // [S] DESIGN-SCAN (graceful; all-local/non-LLM, so always cheap to run)
-  log("== [S] DESIGN-SCAN ==");
-  const det = await detectStack(TARGET);
-  const stack = det.stack;
-  log(`stack: ${stack} (confidence ${det.confidence})`);
-  const files = resolveDesignFiles(TARGET, stack, cfg);
-  let reused = false;
-  try { reused = !!ctx.checkReuse(files); } catch {}
-  const tokens = extractDesignTokens(files, stack, { fillGaps: cfg.designSystem.fillGreenfieldGaps });
-  artifact("design-tokens.json", JSON.stringify(tokens, null, 2));
-  try { ctx.applyStack(det); ctx.applyDesignTokens(tokens); } catch (e) { log("WARN ctx scan: " + e.message); }
-  log(`design files: ${files.length}${reused ? " (unchanged since last run)" : ""}  tokens: colors=${Object.keys(tokens.colors || {}).length} spacing=${Object.keys(tokens.spacing || {}).length}`);
+  // ========== RESUME: load prior spec + verdict, skip scan/plan ==========
+  let spec = null;
+  let lastFinal = null;
+  let startIter = 1;
 
-  const VERIFY = args.verify != null ? args.verify : (cfg.verifyCommand || detectVerifyCmd(TARGET, stack));
-  if (VERIFY) log(`verify: ${VERIFY}`);
+  if (args.resume) {
+    const resumeDir = resolve(args.resume);
+    const specPath = join(resumeDir, "spec.json");
+    if (!existsSync(specPath)) {
+      log(`ERROR: --resume: no spec.json found in ${resumeDir}`);
+      flushLog(); process.exit(1);
+    }
+    try {
+      spec = JSON.parse(readFileSync(specPath, "utf8"));
+      log(`RESUME: loaded spec from ${resumeDir}`);
+    } catch (e) {
+      log(`ERROR: --resume: failed to parse spec.json: ${e.message}`);
+      flushLog(); process.exit(1);
+    }
+    // Find the last completed review
+    for (let ri = MAX_ITERS; ri >= 1; ri--) {
+      const rp = join(resumeDir, `review.${ri}.json`);
+      if (existsSync(rp)) {
+        try { lastFinal = JSON.parse(readFileSync(rp, "utf8")); startIter = ri + 1; } catch {}
+        break;
+      }
+    }
+    log(`RESUME: last review was iter ${startIter - 1}, resuming from iter ${startIter}`);
+    artifact("spec.json", JSON.stringify(spec, null, 2)); // copy to new run dir
+  }
+
+  // ========== [S] DESIGN-SCAN (skipped on resume) ==========
+  let tokens = {};
+  let VERIFY = args.verify != null ? args.verify : (cfg.verifyCommand || "");
+
+  if (!spec) {
+    log("== [S] DESIGN-SCAN ==");
+    const det = await detectStack(TARGET);
+    const stack = det.stack;
+    log(`stack: ${stack} (confidence ${det.confidence})`);
+    const files = resolveDesignFiles(TARGET, stack, cfg);
+    let reused = false;
+    try { reused = !!ctx.checkReuse(files); } catch {}
+    tokens = extractDesignTokens(files, stack, { fillGaps: cfg.designSystem.fillGreenfieldGaps });
+    artifact("design-tokens.json", JSON.stringify(tokens, null, 2));
+    try { ctx.applyStack(det); ctx.applyDesignTokens(tokens); } catch (e) { log("WARN ctx scan: " + e.message); }
+    log(`design files: ${files.length}${reused ? " (unchanged since last run)" : ""}  tokens: colors=${Object.keys(tokens.colors || {}).length} spacing=${Object.keys(tokens.spacing || {}).length}`);
+
+    VERIFY = args.verify != null ? args.verify : (cfg.verifyCommand || detectVerifyCmd(TARGET, stack));
+    if (VERIFY) log(`verify: ${VERIFY}`);
+  } else {
+    log("== [S] DESIGN-SCAN: skipped (resume mode) ==");
+    // Try to load prior tokens from the resume dir for prompt cache warming
+    const tokPath = join(resolve(args.resume), "design-tokens.json");
+    if (existsSync(tokPath)) {
+      try { tokens = JSON.parse(readFileSync(tokPath, "utf8")); } catch {}
+    }
+    if (VERIFY) log(`verify: ${VERIFY}`);
+  }
 
   const refResult = REF_DIR
     ? await ingestReferences([REF_DIR], { runDir: RUN_DIR, cfg, log })
@@ -199,8 +406,8 @@ async function main() {
   if (REF_DIR) log(`references: ${refResult.ok ? refResult.refs.length + " image(s)" : "none (" + (refResult.reason || "n/a") + ")"}`);
   log("");
 
-  // [C3] TEST-DESIGN (pre-code) — optional
-  if (args.tdd || cfg.phases.testDesigner) {
+  // ========== [C3] TEST-DESIGN (optional, skip on resume) ==========
+  if (!spec && (args.tdd || cfg.phases.testDesigner)) {
     log("== [C3] TEST-DESIGN (Opus) ==");
     const tRes = await callOpus(cfg.roles.orchestrator.model,
       P.testDesignerPrompt(TASK, {}, tokens, sliceForAgent(ctx, "planner")),
@@ -210,36 +417,53 @@ async function main() {
     log("");
   }
 
-  // [1] PLAN
-  log("== [1] PLAN (Opus designer) ==");
-  const planBundle = buildImageBundle({ ok: false, shots: [] }, refResult, "plan", cfg);
-  const planRes = await callOpus(cfg.roles.orchestrator.model,
-    P.plannerPrompt(TASK, tokens, sliceForAgent(ctx, "planner"), !!args.consilium) + (planBundle.imageManifestMd || ""),
-    "01-plan", { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude, addDirs: planBundle.addDirs });
-  usage.record({ phase: "plan", agent: "opus", model: cfg.roles.orchestrator.model, envelope: planRes.envelope });
-  const spec = extractJson(planRes.text);
-  if (!spec) { log("ERROR: planner did not return parseable JSON. See 01-plan.raw.txt"); try { await usage.flush(); } catch {} try { await ctxFlush(ctx); } catch {} flushLog(); process.exit(1); }
-  artifact("spec.json", JSON.stringify(spec, null, 2));
-  try { ctx.applySpec(spec); } catch (e) { log("WARN ctx spec: " + e.message); }
-  log("spec.summary: " + (spec.summary || ""));
-  log("acceptance_criteria:\n" + (spec.acceptance_criteria || []).map((c) => "  - " + c).join("\n"));
+  // ========== [1] PLAN (skip on resume) ==========
+  if (!spec) {
+    log(`== [1] PLAN (${PLANNER_MODEL === cfg.roles.orchestrator.model ? "Opus" : PLANNER_MODEL + " (fast planner)"}) ==`);
+    const planBundle = buildImageBundle({ ok: false, shots: [] }, refResult, "plan", cfg);
+    const planRes = await callOpus(PLANNER_MODEL,
+      P.plannerPrompt(TASK, tokens, sliceForAgent(ctx, "planner"), !!args.consilium) + (planBundle.imageManifestMd || ""),
+      "01-plan", { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude, addDirs: planBundle.addDirs });
+    usage.record({ phase: "plan", agent: "opus", model: PLANNER_MODEL, envelope: planRes.envelope });
+    spec = extractJson(planRes.text);
+    if (!spec) { log("ERROR: planner did not return parseable JSON. See 01-plan.raw.txt"); try { await usage.flush(); } catch {} try { await ctxFlush(ctx); } catch {} flushLog(); process.exit(1); }
+    artifact("spec.json", JSON.stringify(spec, null, 2));
+    try { ctx.applySpec(spec); } catch (e) { log("WARN ctx spec: " + e.message); }
+    log("spec.summary: " + (spec.summary || ""));
+    log("acceptance_criteria:\n" + (spec.acceptance_criteria || []).map((c) => "  - " + c).join("\n"));
+
+    // Spec pre-validation (warn only — never fatal)
+    validateSpec(spec);
+  }
 
   const heavySteps = (spec.steps || []).filter((s) => s.heavy === true);
-  // 3-gate (locked & safe): explicit write opt-in AND explicit --consilium AND a planner-flagged heavy step.
   const consiliumOn = cfg.roles.orchestrator.canWrite && !!args.consilium && heavySteps.length > 0;
-  if (heavySteps.length && !consiliumOn) {
+  if (heavySteps.length && !consiliumOn && !LITE_CONSILIUM) {
     log(`NOTE: ${heavySteps.length} heavy step(s) flagged but consilium is OFF (needs roles.orchestrator.canWrite=true AND --consilium). Using normal executor.`);
   }
   if (consiliumOn) log(`CONSILIUM enabled (heavy steps: ${heavySteps.map((s) => s.id).join(", ")}).`);
+  if (LITE_CONSILIUM) log(`LITE-CONSILIUM enabled (read-only dual candidates on heavy steps).`);
+  if (PARALLEL_EXEC) log(`PARALLEL-EXEC enabled (dual candidates on every iteration).`);
   log("");
 
-  let approved = false, lastFinal = null;
+  let approved = false, finalIt = 0;
 
-  for (let it = 1; it <= MAX_ITERS; it++) {
+  for (let it = startIter; it <= MAX_ITERS; it++) {
     let execCode = 0, execTimedOut = false;
 
-    // [2|E] EXECUTE or CONSILIUM
+    // ========== Budget check before expensive executor call ==========
+    const budgetState = checkBudget(usage);
+    if (!budgetState.ok) { log("BUDGET: stopping — ceiling exceeded."); break; }
+    // Disable optional phases if > 90% consumed
+    const budgetTight = BUDGET_USD > 0 && budgetState.remaining < BUDGET_USD * 0.1;
+    if (budgetTight) log("BUDGET: < 10% remaining — optional phases (audit/dual-review) disabled this iteration");
+
+    // ========== [2|E] EXECUTE or CONSILIUM or DUAL-CANDIDATES ==========
+    const useParallelThisIter = PARALLEL_EXEC || (LITE_CONSILIUM && it > 0);
+    const useLiteConsil = LITE_CONSILIUM && heavySteps.length > 0;
+
     if (consiliumOn) {
+      // --- Full CONSILIUM (canWrite, heavy steps only) ---
       log(`== [E.${it}] CONSILIUM ==`);
       if ((await git(["status", "--short"])).stdout.trim()) {
         log("ABORT consilium: working tree is dirty (would risk user work). Falling back to single executor.");
@@ -276,23 +500,40 @@ async function main() {
           usage.record({ phase: `consilium-materialize-${it}`, agent: "opus", model: "opus", envelope: w.envelope });
         }
       }
+    } else if (PARALLEL_EXEC || (useLiteConsil)) {
+      // --- LITE-CONSILIUM / PARALLEL-EXEC: dual candidates, read-only arbiter ---
+      log(`== [${PARALLEL_EXEC ? "2P" : "EL"}.${it}] ${PARALLEL_EXEC ? "PARALLEL-EXEC" : "LITE-CONSILIUM"} ==`);
+      const execMsg = it === 1
+        ? P.executorMessage(spec, TASK, sliceForAgent(ctx, "executor"))
+        : P.executorRetryMessage(spec, lastFinal, sliceForAgent(ctx, "executor"), {
+            changedFiles: (await git(["status", "--short"])).stdout.trim().split(/\r?\n/).map((l) => l.slice(3)).filter(Boolean),
+            trapsBlock: ctx.sections?.executorTraps,
+          });
+      await withMimoLock(() => runDualCandidates(it, execMsg, tokens));
+      // execCode stays 0 (dual-candidates handles fallback internally)
     } else {
+      // --- Normal EXECUTE ---
       log(`== [2.${it}] EXECUTE (${EXECUTOR}) ==`);
       const msg = it === 1
         ? P.executorMessage(spec, TASK, sliceForAgent(ctx, "executor"))
-        : P.executorRetryMessage(spec, lastFinal, sliceForAgent(ctx, "executor"));
-      const ex = await runExecutor(EXECUTOR, msg, it > 1);
+        : P.executorRetryMessage(spec, lastFinal, sliceForAgent(ctx, "executor"), {
+            changedFiles: (await git(["status", "--short"])).stdout.trim().split(/\r?\n/).map((l) => l.slice(3)).filter(Boolean),
+            trapsBlock: ctx.sections?.executorTraps,
+          });
+      const ex = await withMimoLock(() => runExecutor(EXECUTOR, msg, it > 1));
       execCode = ex.code; execTimedOut = !!ex.timedOut;
       artifact(`exec.${it}.log`, (ex.stdout || "") + "\n----STDERR----\n" + (ex.stderr || ""));
       usage.record({ phase: `execute-${it}`, agent: EXECUTOR, model: execModel || "", contextSliceChars: sliceForAgent(ctx, "executor").length });
     }
     log(`executor exit=${execCode}${execTimedOut ? " (timed out)" : ""}`);
 
-    // [diff] + GATE-EXEC (BUG-5). captureDiff includes untracked NEW files (git diff HEAD drops them).
+    // ========== [diff] + GATE-EXEC ==========
     const diff = await captureDiff();
     const status = (await git(["status", "--short"])).stdout;
     artifact(`diff.${it}.patch`, diff);
-    const changedCount = status.trim() ? status.trim().split(/\r?\n/).length : 0;
+    const changedLines = status.trim() ? status.trim().split(/\r?\n/) : [];
+    const changedCount = changedLines.length;
+    const changed = changedLines.map((l) => l.slice(3)).filter(Boolean);
     log("changed files: " + (changedCount || "(none)"));
     try { ctx.applyIteration(it, { execCode, changedCount }); } catch {}
 
@@ -303,21 +544,25 @@ async function main() {
       };
       artifact(`review.${it}.json`, JSON.stringify(lastFinal, null, 2));
       try { ctx.applyReview(it, lastFinal); } catch {}
+      // Adaptive abort: if first iter produced nothing and score effectively 0, no point retrying
+      if (it === 1 && (lastFinal.score || 0) < ABORT_SCORE && !diff.trim()) {
+        log(`EARLY-ABORT: executor produced no diff on iter 1 — stopping early.`);
+        break;
+      }
       log("GATE: no usable changes — skipping review this iteration.");
       if (it < MAX_ITERS) { log(""); continue; } else break;
     }
 
-    // [R] RENDER (optional, graceful)
-    const changed = status.trim().split(/\r?\n/).map((l) => l.slice(3)).filter(Boolean);
+    // ========== [R] RENDER (optional) ==========
     const rr = (args.render || cfg.phases.render)
-      ? await render(TARGET, stack, changed, { runDir: RUN_DIR, cfg, log, refImages: refResult.refs })
+      ? await render(TARGET, (cfg.frontMatter?.stack || "generic"), changed, { runDir: RUN_DIR, cfg, log, refImages: refResult.refs })
       : { ok: false, reason: "render-disabled", shots: [], skipped: [], warnings: [] };
     if (!rr.ok) log(`render: skipped (${rr.reason}) — text-only review.`);
     else log(`render: ${rr.shots.length} screenshot(s) via ${rr.engine}`);
     const reviewBundle = buildImageBundle(rr, refResult, "review", cfg);
     artifact(`render.${it}.json`, JSON.stringify({ result: rr, skipped: reviewBundle.skippedNote }, null, 2));
 
-    // [V] VERIFY (optional) — BUG-3: POSIX uses /bin/sh
+    // ========== [V] VERIFY (optional) ==========
     let verifyOut = "";
     if (VERIFY) {
       log(`-- verify: ${VERIFY}`);
@@ -330,13 +575,13 @@ async function main() {
 
     if (args.noReview) { log("[--no-review] stopping after execution."); approved = true; break; }
 
-    // [3] REVIEW (primary)
-    log(`== [3.${it}] REVIEW (Opus) ==`);
+    // ========== [3] REVIEW (escalating: Sonnet → Opus) ==========
+    log(`== [3.${it}] REVIEW${ESCALATE_REVIEWER ? " (escalating)" : " (Opus)"} ==`);
     const refNote = (refResult.ok && rr.ok) ? "reference images attached — compare visually" : "";
-    const revRes = await callOpus(cfg.roles.reviewer.model,
-      P.reviewerPrompt(TASK, spec, truncate(diff, cfg.diffMaxChars), truncate(verifyOut, cfg.verifyMaxChars),
-        tokens, sliceForAgent(ctx, "reviewer"), reviewBundle.imageManifestMd, refNote),
-      `03-review-${it}`, { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude, addDirs: reviewBundle.addDirs });
+    const revPrompt = P.reviewerPrompt(TASK, spec, truncate(diff, cfg.diffMaxChars), truncate(verifyOut, cfg.verifyMaxChars),
+      tokens, sliceForAgent(ctx, "reviewer"), reviewBundle.imageManifestMd, refNote);
+    const revRes = await callReviewer(revPrompt, `03-review-${it}`,
+      { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude, addDirs: reviewBundle.addDirs });
     usage.record({ phase: `review-${it}`, agent: "opus", model: cfg.roles.reviewer.model, envelope: revRes.envelope });
     const verdict = extractJson(revRes.text) || { approved: false, feedback_for_executor: "Reviewer output unparseable; re-check vs acceptance criteria." };
     artifact(`review.${it}.json`, JSON.stringify(verdict, null, 2));
@@ -344,8 +589,20 @@ async function main() {
     log(`verdict: approved=${verdict.approved} score=${verdict.score ?? "?"} — ${verdict.summary || ""}`);
     if ((verdict.blocking_issues || []).length) log("blocking:\n" + verdict.blocking_issues.map((b) => "  - " + b).join("\n"));
 
-    // [C2] DUAL-REVIEW
-    if (args.dualReview || cfg.phases.secondReviewer) {
+    // Record executor failure patterns into context (used in next retry)
+    if (!verdict.approved) {
+      try { ctx.applyExecutorFailure(it, verdict); } catch {}
+    }
+
+    // ========== Adaptive early-exit: score >= EARLY_EXIT_SCORE + no blocking ==========
+    if (!verdict.approved && typeof verdict.score === "number"
+        && verdict.score >= EARLY_EXIT_SCORE && !(verdict.blocking_issues || []).length) {
+      log(`EARLY-EXIT: score ${verdict.score} >= ${EARLY_EXIT_SCORE} with no blocking issues → auto-approving`);
+      final = { ...verdict, approved: true, feedback_for_executor: "" };
+    }
+
+    // ========== [C2] DUAL-REVIEW (optional, skip if budget tight) ==========
+    if ((args.dualReview || cfg.phases.secondReviewer) && !budgetTight) {
       log(`== [C2.${it}] SECOND REVIEW (Gemini) + arbitration (Opus) ==`);
       const g = await callGemini(P.secondReviewerPrompt(TASK, spec, truncate(diff, cfg.diffMaxChars), truncate(verifyOut, cfg.verifyMaxChars), tokens),
         cfg.geminiExecutor.model, { cwd: TARGET, runDir: RUN_DIR, geminiBin: cfg.bins.gemini });
@@ -360,7 +617,7 @@ async function main() {
       log(`arbitrated verdict: approved=${final.approved} score=${final.score ?? "?"}`);
     }
 
-    // [D2] REFERENCE (optional, advisory)
+    // ========== [D2] REFERENCE (optional) ==========
     if (refResult.ok && rr.ok && rr.shots.length) {
       log(`== [D2.${it}] REFERENCE COMPARISON ==`);
       const cmp = await compareToReference(rr.shots, refResult.refs, { runDir: RUN_DIR, cfg, log });
@@ -371,11 +628,13 @@ async function main() {
       artifact(`reference.${it}.json`, JSON.stringify(extractJson(refRes.text) || {}, null, 2));
     }
 
-    // [C4] AUDITS — final gate, only when review approved
+    // ========== [C4] AUDITS (optional, final gate, skip if budget tight) ==========
     let auditsClean = true;
-    if ((args.audit || cfg.phases.audits) && final.approved) {
+    if ((args.audit || cfg.phases.audits) && final.approved && !budgetTight) {
       log(`== [C4.${it}] AUDITS (a11y/perf/security/i18n) ==`);
       for (const kind of ["a11y", "perf", "security", "i18n"]) {
+        const budS = checkBudget(usage);
+        if (!budS.ok) { log(`BUDGET: skipping audit ${kind}`); break; }
         const au = await callOpus(cfg.roles.reviewer.model,
           P.auditPrompt(kind, TASK, spec, truncate(diff, cfg.diffMaxChars), tokens),
           `audit-${it}-${kind}`, { dir: TARGET, runDir: RUN_DIR, claudeBin: cfg.bins.claude });
@@ -391,7 +650,7 @@ async function main() {
       }
     }
 
-    // [B4] UX-WRITER (optional, advisory)
+    // ========== [B4] UX-WRITER (optional) ==========
     if (args.uxCopy || cfg.phases.uxCopy || (spec.design && spec.design.copy_needed)) {
       log(`== [B4.${it}] UX-WRITER ==`);
       const ux = await callOpus(cfg.roles.reviewer.model, P.uxWriterPrompt(TASK, spec, tokens, sliceForAgent(ctx, "reviewer")),
@@ -401,15 +660,33 @@ async function main() {
     }
 
     lastFinal = final;
+    finalIt = it;
     try { ctx.applyReview(it, final); } catch {}
     approved = !!final.approved && auditsClean;
     if (approved) break;
     if (it < MAX_ITERS) log("-> feeding feedback back to executor...\n");
+
+    // Adaptive abort: very low score + another chance would waste budget
+    if (typeof final.score === "number" && final.score < ABORT_SCORE && it < MAX_ITERS) {
+      log(`EARLY-ABORT: score ${final.score} < ${ABORT_SCORE} — executor not converging, stopping early.`);
+      break;
+    }
   }
 
-  // [RESULT]
+  // ========== [RESULT] ==========
   log("\n== RESULT ==");
-  log(approved ? "APPROVED ✅" : `NOT APPROVED after ${MAX_ITERS} iterations ❌`);
+  log(approved ? "APPROVED ✅" : `NOT APPROVED after ${finalIt || MAX_ITERS} iteration(s) ❌`);
+
+  // Cost summary
+  try {
+    const totals = usage.snapshotTotals();
+    log(`cost     : $${totals.est_cost_usd.toFixed(4)}  (baseline $${totals.baseline_all_opus_est.toFixed(4)}, savings ≈${totals.savings_pct}%)`);
+    if (PLANNER_MODEL !== cfg.roles.orchestrator.model) {
+      const plannerCalls = (totals.by_agent?.opus?.calls || 0);
+      log(`           planner model: ${PLANNER_MODEL}${plannerCalls ? " (" + plannerCalls + " Opus call(s) total)" : ""}`);
+    }
+  } catch {}
+
   try { await usage.flush(); } catch (e) { log("WARN usage.flush: " + e.message); }
   try { await ctxFlush(ctx); snapshotToRun(ctx); } catch (e) { log("WARN ctx.flush: " + e.message); }
   log(`artifacts: ${RUN_DIR}`);
